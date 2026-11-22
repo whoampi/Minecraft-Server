@@ -1,0 +1,717 @@
+---
+# ============================================================
+# provision.yml — Construye el proyecto TEL342 DESDE CERO
+# sobre dos Debian 13 (trixie) limpios: gateway + servidor.
+#
+#   ansible-playbook -i inventory.ini provision.yml -K
+#
+# Qué hace (idempotente):
+#   GATEWAY  -> paquetes, red estática, ip_forward, firewall nftables
+#               (fase1/fase2 + persistencia al boot), Prometheus,
+#               Grafana y node_exporter + exportador de contadores.
+#   SERVIDOR -> JVMs (BellSoft 17 para la vulnerable, OpenJDK 25 para
+#               la actualizada), usuarios, instancias Minecraft,
+#               server.properties, units systemd, node_exporter y
+#               exportador de jugadores por RCON.
+#
+# REQUISITOS PREVIOS (no los hace este playbook):
+#   - 2 VMs Debian 13 con la red de VirtualBox ya puesta:
+#       gw: adaptador1 Host-Only (vboxnet0) + adaptador2 red interna svmc-priv
+#       mc: adaptador1 red interna svmc-priv
+#   - SSH habilitado; usuarios jbjp_gw / jbjp_mc con sudo.
+#   - INTERNET en ambas VMs durante la provision (p.ej. un adaptador NAT
+#     temporal): se instalan paquetes y se descargan los server.jar de Mojang.
+#
+# Los server.jar (26.3 y 1.18) se descargan SOLOS desde el manifiesto oficial
+# de Mojang (verificando sha1); no hay que ponerlos a mano. dashboard.json y
+# rcon.py ya vienen en el repo (files/).
+#
+# NOTA: openjdk-25 puede no estar en el repo base de trixie; si falla,
+#       habilitar backports (ver README). BellSoft y Grafana se agregan
+#       como repos externos en este playbook.
+# ============================================================
+
+# ------------------------------------------------------------
+# PLAY 1 — GATEWAY / FIREWALL / MONITOREO
+# ------------------------------------------------------------
+- name: "GATEWAY — firewall, ruteo y stack de monitoreo"
+  hosts: gateway
+  become: true
+  vars:
+    up_if: enp0s3           # uplink host-only
+    priv_if: enp0s8         # red privada hacia el servidor
+    gw_up_ip: 192.168.56.10
+    gw_priv_ip: 10.10.10.1
+    mc_ip: 10.10.10.10
+  tasks:
+
+    - name: Paquetes base (firewall + monitoreo desde repos Debian)
+      ansible.builtin.apt:
+        name:
+          - nftables
+          - python3
+          - prometheus
+          - prometheus-node-exporter
+          - prometheus-node-exporter-collectors
+        state: present
+        update_cache: true
+
+    # ---- Grafana (repo externo oficial) ----
+    - name: Carpeta de llaveros APT
+      ansible.builtin.file: { path: /etc/apt/keyrings, state: directory, mode: '0755' }
+
+    - name: Clave APT de Grafana
+      ansible.builtin.get_url:
+        url: https://apt.grafana.com/gpg.key
+        dest: /etc/apt/keyrings/grafana.asc
+        mode: '0644'
+
+    - name: Repo de Grafana
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main"
+        filename: grafana
+        state: present
+
+    - name: Instalar Grafana
+      ansible.builtin.apt: { name: grafana, state: present, update_cache: true }
+
+    # ---- Red estática ----
+    - name: Configurar /etc/network/interfaces (IPs fijas)
+      ansible.builtin.copy:
+        dest: /etc/network/interfaces
+        mode: '0644'
+        content: |
+          source /etc/network/interfaces.d/*
+
+          auto lo
+          iface lo inet loopback
+
+          # Cara LAN / host-only (vboxnet0) - IP fija
+          auto {{ up_if }}
+          iface {{ up_if }} inet static
+              address {{ gw_up_ip }}/24
+
+          # Cara privada hacia Minecraft (red interna svmc-priv)
+          auto {{ priv_if }}
+          iface {{ priv_if }} inet static
+              address {{ gw_priv_ip }}/24
+      # OJO: no reiniciamos la red para no cortar la sesión SSH (las IPs no cambian).
+
+    - name: IP forwarding persistente
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ipforward.conf
+        content: "net.ipv4.ip_forward=1\n"
+        mode: '0644'
+    - name: Activar ip_forward ahora
+      ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+      changed_when: false
+
+    # ---- Firewall nftables (archivos reales) ----
+    - name: Carpeta del firewall
+      ansible.builtin.file: { path: /root/gateway, state: directory, mode: '0755' }
+
+    - name: fase1-vulnerable.nft
+      ansible.builtin.copy:
+        dest: /root/gateway/fase1-vulnerable.nft
+        mode: '0644'
+        content: |
+          #!/usr/sbin/nft -f
+          flush ruleset
+          define UP_IF   = "{{ up_if }}"
+          define PRIV_IF = "{{ priv_if }}"
+          define MC_IP   = {{ mc_ip }}
+          table ip nat {
+              chain prerouting {
+                  type nat hook prerouting priority dstnat; policy accept;
+                  iifname $UP_IF tcp dport 25565-25580 counter dnat to $MC_IP
+              }
+              chain postrouting {
+                  type nat hook postrouting priority srcnat; policy accept;
+                  oifname $UP_IF counter masquerade
+                  oifname $PRIV_IF counter masquerade
+              }
+          }
+          table inet filter {
+              counter c_aceptado_25565 { }
+              counter c_fwd_drop { }
+              counter c_callback { }
+              chain forward {
+                  type filter hook forward priority filter; policy accept;
+                  iifname $UP_IF oifname $PRIV_IF ip daddr $MC_IP tcp dport 25565 counter name c_aceptado_25565
+                  iifname $PRIV_IF oifname $UP_IF tcp dport 1389 counter name c_callback
+              }
+          }
+
+    - name: fase2-segura.nft
+      ansible.builtin.copy:
+        dest: /root/gateway/fase2-segura.nft
+        mode: '0644'
+        content: |
+          #!/usr/sbin/nft -f
+          flush ruleset
+          define UP_IF   = "{{ up_if }}"
+          define PRIV_IF = "{{ priv_if }}"
+          define MC_IP   = {{ mc_ip }}
+          table ip nat {
+              chain prerouting {
+                  type nat hook prerouting priority dstnat; policy accept;
+                  iifname $UP_IF tcp dport 25565 counter dnat to $MC_IP
+              }
+              chain postrouting {
+                  type nat hook postrouting priority srcnat; policy accept;
+                  oifname $UP_IF counter masquerade
+                  oifname $PRIV_IF counter masquerade
+              }
+          }
+          table inet filter {
+              counter c_aceptado_25565 { }
+              counter c_fwd_drop { }
+              counter c_callback { }
+              chain forward {
+                  type filter hook forward priority filter; policy drop;
+                  ct state established,related counter accept
+                  iifname $UP_IF oifname $PRIV_IF ip daddr $MC_IP tcp dport 25565 counter name c_aceptado_25565 accept
+                  iifname $PRIV_IF oifname $UP_IF udp dport 53 counter accept
+                  iifname $PRIV_IF oifname $UP_IF tcp dport { 53, 80, 443 } counter accept
+                  iifname $PRIV_IF oifname $UP_IF tcp dport 1389 counter name c_callback
+                  counter name c_fwd_drop log prefix "FWD-DROP " drop
+              }
+          }
+
+    - name: aplicar-fase.sh
+      ansible.builtin.copy:
+        dest: /root/gateway/aplicar-fase.sh
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          case "${1:-}" in
+            fase1) F="$DIR/fase1-vulnerable.nft" ;;
+            fase2) F="$DIR/fase2-segura.nft" ;;
+            *) echo "Uso: sudo $0 fase1|fase2"; exit 1 ;;
+          esac
+          sysctl -w net.ipv4.ip_forward=1 >/dev/null
+          nft -f "$F"
+          echo "[ok] Aplicada: $(basename "$F")"
+          nft list ruleset
+
+    - name: "Servicio que re-aplica el firewall en CADA boot (arregla el flush de nftables)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/firewall-fase.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Aplica la fase del firewall nftables al arranque
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=true
+          ExecStart=/root/gateway/aplicar-fase.sh fase1
+          [Install]
+          WantedBy=multi-user.target
+      # Para "seguro por defecto" cambiar fase1 -> fase2 en ExecStart.
+
+    - name: Habilitar y aplicar el firewall ahora
+      ansible.builtin.systemd:
+        name: firewall-fase.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ---- Exportador de contadores nftables ----
+    - name: nft-metrics.sh
+      ansible.builtin.copy:
+        dest: /usr/local/bin/nft-metrics.sh
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          OUT=/var/lib/prometheus/node-exporter/nftables.prom
+          mkdir -p "$(dirname "$OUT")"
+          TMP="$OUT.$$"
+          {
+            echo "# HELP nft_counter_packets Paquetes por contador nftables con nombre."
+            echo "# TYPE nft_counter_packets counter"
+            nft -j list counters 2>/dev/null | python3 -c '
+          import sys,json
+          d=json.load(sys.stdin)
+          for o in d.get("nftables",[]):
+              c=o.get("counter")
+              if c and "name" in c:
+                  print("nft_counter_packets{name=\"%s\"} %d"%(c["name"],c.get("packets",0)))
+          '
+          } > "$TMP" && mv "$TMP" "$OUT"
+
+    - name: nft-metrics.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nft-metrics.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Exporta contadores nftables a textfile collector
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/nft-metrics.sh
+
+    - name: nft-metrics.timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nft-metrics.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Refresca metricas nftables cada 5s
+          [Timer]
+          OnBootSec=10
+          OnUnitActiveSec=5
+          AccuracySec=1s
+          [Install]
+          WantedBy=timers.target
+
+    - name: Habilitar timer de nft-metrics
+      ansible.builtin.systemd: { name: nft-metrics.timer, enabled: true, state: started, daemon_reload: true }
+
+    # ---- Prometheus ----
+    - name: prometheus.yml (scrape gw + servidor cada 5s)
+      ansible.builtin.copy:
+        dest: /etc/prometheus/prometheus.yml
+        mode: '0644'
+        content: |
+          global:
+            scrape_interval: 5s
+          scrape_configs:
+            - job_name: 'node'
+              static_configs:
+                - targets: ['localhost:9100', '{{ mc_ip }}:9100']
+      notify: reiniciar prometheus
+
+    - name: Asegurar directorio textfile collector
+      ansible.builtin.file:
+        path: /var/lib/prometheus/node-exporter
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+
+    - name: Servicios de monitoreo arriba
+      ansible.builtin.systemd: { name: "{{ item }}", enabled: true, state: started }
+      loop:
+        - prometheus-node-exporter
+        - prometheus
+        - grafana-server
+
+    # ---- Grafana: datasource + dashboard + password admin ----
+    - name: Provisionar datasource Prometheus
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/datasources/prometheus.yml
+        mode: '0644'
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://localhost:9090
+              isDefault: true
+      notify: reiniciar grafana
+
+    - name: Provisionar proveedor de dashboards
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/dashboards/proyecto.yml
+        mode: '0644'
+        content: |
+          apiVersion: 1
+          providers:
+            - name: proyecto
+              type: file
+              folder: ''
+              options:
+                path: /var/lib/grafana/dashboards
+      notify: reiniciar grafana
+
+    - name: Carpeta de dashboards de Grafana
+      ansible.builtin.file:
+        path: /var/lib/grafana/dashboards
+        state: directory
+        owner: grafana
+        group: grafana
+        mode: '0755'
+
+    - name: Copiar dashboard del proyecto (si está en files/)
+      ansible.builtin.copy:
+        src: files/dashboard.json
+        dest: /var/lib/grafana/dashboards/dashboard.json
+        owner: grafana
+        group: grafana
+        mode: '0644'
+      ignore_errors: true
+      notify: reiniciar grafana
+
+    - name: Fijar password de admin de Grafana (admin/1234)
+      ansible.builtin.command: grafana-cli admin reset-admin-password 1234
+      changed_when: false
+      ignore_errors: true
+
+  handlers:
+    - name: reiniciar prometheus
+      ansible.builtin.systemd: { name: prometheus, state: restarted }
+    - name: reiniciar grafana
+      ansible.builtin.systemd: { name: grafana-server, state: restarted }
+
+# ------------------------------------------------------------
+# PLAY 2 — SERVIDOR MINECRAFT (dos instancias)
+# ------------------------------------------------------------
+- name: "SERVIDOR — JVMs, instancias Minecraft y exportador de jugadores"
+  hosts: server
+  become: true
+  vars:
+    base_dir: /srv-proyecto-admin
+    jvm_actualizado: /usr/lib/jvm/java-25-openjdk-amd64/bin/java
+    jvm_vulnerable: /usr/lib/jvm/bellsoft-java17-amd64/bin/java
+    instancias:
+      - { nombre: mc-actualizado, version: "26.3", jar: server-26.3.jar }
+      - { nombre: mc-vulnerable,  version: "1.18", jar: server-1.18.jar }
+  tasks:
+
+    # ---- JVMs ----
+    - name: Carpeta de llaveros APT
+      ansible.builtin.file: { path: /etc/apt/keyrings, state: directory, mode: '0755' }
+
+    - name: Clave APT de BellSoft
+      ansible.builtin.get_url:
+        url: https://download.bell-sw.com/pki/GPG-KEY-bellsoft
+        dest: /etc/apt/keyrings/bellsoft.asc
+        mode: '0644'
+
+    - name: Repo de BellSoft
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/bellsoft.asc] https://apt.bell-sw.com/deb stable main"
+        filename: bellsoft
+        state: present
+
+    - name: Instalar JVMs y utilidades de monitoreo
+      ansible.builtin.apt:
+        name:
+          - bellsoft-java17        # JVM de la instancia vulnerable (1.18)
+          - openjdk-25-jre-headless  # JVM de la instancia actualizada (26.3) -- ver README si falta
+          - python3
+          - prometheus-node-exporter
+          - prometheus-node-exporter-collectors
+          - python3-prometheus-client
+        state: present
+        update_cache: true
+
+    # ---- Usuarios y carpetas ----
+    - name: Grupos de las instancias
+      ansible.builtin.group: { name: "{{ item }}", system: true }
+      loop: [mc-actualizado, mc-vulnerable]
+
+    - name: Usuarios de sistema de las instancias
+      ansible.builtin.user:
+        name: "{{ item }}"
+        group: "{{ item }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ base_dir }}/{{ item }}"
+        create_home: false
+      loop: [mc-actualizado, mc-vulnerable]
+
+    - name: Carpeta base
+      ansible.builtin.file:
+        path: "{{ base_dir }}"
+        state: directory
+        owner: mc-actualizado
+        group: mc-actualizado
+        mode: '0710'
+
+    - name: Carpetas de cada instancia
+      ansible.builtin.file:
+        path: "{{ base_dir }}/{{ item }}"
+        state: directory
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        mode: '0750'
+      loop: [mc-actualizado, mc-vulnerable]
+
+    # ---- Jars: descarga oficial desde Mojang (verificando sha1) ----
+    - name: Obtener manifiesto de versiones de Mojang
+      ansible.builtin.uri:
+        url: https://piston-meta.mojang.com/mc/game/version_manifest_v2.json
+        return_content: true
+      register: mojang_manifest
+
+    - name: Descargar cada server.jar oficial (propiedad de root, como el original)
+      ansible.builtin.include_tasks: tasks/descargar-jar.yml
+      loop: "{{ instancias }}"
+      loop_control: { loop_var: inst }
+
+    # ---- EULA ----
+    - name: Aceptar EULA en cada instancia
+      ansible.builtin.copy:
+        dest: "{{ base_dir }}/{{ item }}/eula.txt"
+        content: "eula=true\n"
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        mode: '0640'
+      loop: [mc-actualizado, mc-vulnerable]
+
+    # ---- server.properties ----
+    - name: server.properties — instancia ACTUALIZADA (26.3)
+      ansible.builtin.copy:
+        dest: "{{ base_dir }}/mc-actualizado/server.properties"
+        owner: mc-actualizado
+        group: mc-actualizado
+        mode: '0640'
+        content: |
+          accepts-transfers=false
+          allow-flight=false
+          broadcast-console-to-ops=true
+          broadcast-rcon-to-ops=true
+          bug-report-link=
+          chat-spam-threshold-seconds=10
+          command-spam-threshold-seconds=10
+          difficulty=easy
+          enable-code-of-conduct=false
+          enable-jmx-monitoring=false
+          enable-query=false
+          enable-rcon=true
+          enable-status=true
+          enforce-secure-profile=true
+          enforce-whitelist=false
+          entity-broadcast-range-percentage=100
+          force-gamemode=false
+          function-permission-level=2
+          gamemode=survival
+          generate-structures=true
+          generator-settings={}
+          hardcore=false
+          hide-online-players=false
+          initial-disabled-packs=
+          initial-enabled-packs=vanilla
+          level-name=world
+          level-seed=
+          level-type=minecraft\:normal
+          log-ips=true
+          management-server-allowed-origins=
+          management-server-enabled=false
+          management-server-host=localhost
+          management-server-port=0
+          management-server-secret=
+          management-server-tls-enabled=true
+          management-server-tls-keystore=
+          management-server-tls-keystore-password=
+          max-chained-neighbor-updates=1000000
+          max-players=20
+          max-tick-time=60000
+          max-world-size=29999984
+          motd=A Minecraft Server
+          network-compression-threshold=256
+          online-mode=false
+          op-permission-level=4
+          pause-when-empty-seconds=60
+          player-idle-timeout=0
+          prevent-proxy-connections=false
+          query.port=25565
+          rate-limit=0
+          rcon.password=admin123
+          rcon.port=25575
+          region-file-compression=deflate
+          require-resource-pack=false
+          resource-pack=
+          resource-pack-id=
+          resource-pack-prompt=
+          resource-pack-sha1=
+          server-ip=10.10.10.10
+          server-port=25565
+          simulation-distance=10
+          spawn-protection=16
+          status-heartbeat-interval=0
+          sync-chunk-writes=true
+          text-filtering-config=
+          text-filtering-version=0
+          use-native-transport=true
+          view-distance=10
+          white-list=false
+
+    - name: server.properties — instancia VULNERABLE (1.18)
+      ansible.builtin.copy:
+        dest: "{{ base_dir }}/mc-vulnerable/server.properties"
+        owner: mc-vulnerable
+        group: mc-vulnerable
+        mode: '0640'
+        content: |
+          enable-jmx-monitoring=false
+          rcon.port=25576
+          gamemode=survival
+          enable-command-block=false
+          enable-query=false
+          level-name=world
+          motd=A Minecraft Server
+          query.port=25565
+          pvp=true
+          difficulty=easy
+          network-compression-threshold=256
+          require-resource-pack=false
+          max-tick-time=60000
+          use-native-transport=true
+          max-players=20
+          online-mode=false
+          enable-status=true
+          allow-flight=false
+          broadcast-rcon-to-ops=true
+          view-distance=10
+          server-ip=10.10.10.10
+          resource-pack-prompt=
+          allow-nether=true
+          server-port=25566
+          enable-rcon=true
+          sync-chunk-writes=true
+          op-permission-level=4
+          prevent-proxy-connections=false
+          hide-online-players=false
+          resource-pack=
+          entity-broadcast-range-percentage=100
+          simulation-distance=10
+          rcon.password=admin123
+          player-idle-timeout=0
+          force-gamemode=false
+          rate-limit=0
+          hardcore=false
+          white-list=false
+          broadcast-console-to-ops=true
+          spawn-npcs=true
+          spawn-animals=true
+          function-permission-level=2
+          text-filtering-config=
+          spawn-monsters=true
+          enforce-whitelist=false
+          resource-pack-sha1=
+          spawn-protection=16
+          max-world-size=29999984
+
+    # ---- Units systemd de las instancias ----
+    - name: Unit mc-actualizado.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mc-actualizado.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Minecraft 26.3 - Proyecto Admin de Redes
+
+          [Service]
+          User=mc-actualizado
+          Group=mc-actualizado
+          WorkingDirectory={{ base_dir }}/mc-actualizado
+          ExecStart={{ jvm_actualizado }} -Xms1G -Xmx2G -jar {{ base_dir }}/mc-actualizado/server-26.3.jar nogui
+          TimeoutStopSec=120
+          SuccessExitStatus=143
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Unit mc-vulnerable.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mc-vulnerable.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Minecraft 1.18 - Proyecto Admin de Redes
+
+          [Service]
+          User=mc-vulnerable
+          Group=mc-vulnerable
+          WorkingDirectory={{ base_dir }}/mc-vulnerable
+          ExecStart={{ jvm_vulnerable }} -Xms1G -Xmx2G -jar {{ base_dir }}/mc-vulnerable/server-1.18.jar nogui
+          TimeoutStopSec=120
+          SuccessExitStatus=143
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Habilitar e iniciar instancias (el primer arranque genera el world)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop: [mc-actualizado, mc-vulnerable]
+
+    # ---- Exportador de jugadores por RCON ----
+    - name: mc-players.py
+      ansible.builtin.copy:
+        dest: /usr/local/bin/mc-players.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import socket, struct, re, os
+          OUT = "/var/lib/prometheus/node-exporter/minecraft.prom"
+          TARGETS = [("actualizado", "10.10.10.10", 25575, "admin123"),
+                     ("vulnerable",   "10.10.10.10", 25576, "admin123")]
+
+          def rcon(host, port, pw, cmd):
+              s = socket.create_connection((host, port), timeout=3)
+              def send(rid, typ, body):
+                  data = struct.pack("<ii", rid, typ) + body.encode() + b"\x00\x00"
+                  s.sendall(struct.pack("<i", len(data)) + data)
+              def recv():
+                  ln = struct.unpack("<i", s.recv(4))[0]
+                  data = b""
+                  while len(data) < ln:
+                      data += s.recv(ln - len(data))
+                  rid, typ = struct.unpack("<ii", data[:8])
+                  return rid, typ, data[8:-2].decode(errors="ignore")
+              send(1, 3, pw); recv()
+              send(2, 2, cmd); _, _, resp = recv()
+              s.close(); return resp
+
+          lines = ["# HELP minecraft_players_online Jugadores conectados por instancia.",
+                   "# TYPE minecraft_players_online gauge"]
+          for name, host, port, pw in TARGETS:
+              try:
+                  r = rcon(host, port, pw, "list")
+                  m = re.search(r"(\d+)", r)
+                  n = int(m.group(1)) if m else 0
+                  lines.append('minecraft_players_online{instance="%s"} %d' % (name, n))
+              except Exception:
+                  pass
+          os.makedirs(os.path.dirname(OUT), exist_ok=True)
+          tmp = OUT + ".tmp"
+          open(tmp, "w").write("\n".join(lines) + "\n")
+          os.replace(tmp, OUT)
+
+    - name: mc-players.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mc-players.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Exporta jugadores Minecraft (RCON) a textfile collector
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/mc-players.py
+
+    - name: mc-players.timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mc-players.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Refresca jugadores Minecraft cada 10s
+          [Timer]
+          OnBootSec=30
+          OnUnitActiveSec=10
+          AccuracySec=1s
+          [Install]
+          WantedBy=timers.target
+
+    - name: Directorio textfile collector
+      ansible.builtin.file:
+        path: /var/lib/prometheus/node-exporter
+        state: directory
+        mode: '0755'
+
+    - name: node_exporter y timer de jugadores arriba
+      ansible.builtin.systemd: { name: "{{ item }}", enabled: true, state: started, daemon_reload: true }
+      loop:
+        - prometheus-node-exporter
+        - mc-players.timer

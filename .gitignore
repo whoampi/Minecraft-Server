@@ -1,0 +1,13 @@
+# Artefactos locales que NO van al repo
+*.retry
+*.log
+__pycache__/
+*.pyc
+
+# Jars: se descargan solos desde Mojang en tiempo de provision, no se versionan
+*.jar
+
+# OVAs y binarios pesados (se distribuyen aparte, no por Git)
+*.ova
+*.vdi
+*.vmdk

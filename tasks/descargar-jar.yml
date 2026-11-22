@@ -1,0 +1,26 @@
+---
+# Descarga el server.jar OFICIAL de una versión de Minecraft desde Mojang.
+# Espera la variable `inst` = { nombre, version, jar } y `mojang_manifest`
+# (contenido del version_manifest_v2.json) ya registrado.
+
+- name: "[{{ inst.version }}] Resolver URL de metadata de la versión"
+  ansible.builtin.set_fact:
+    _meta_url: >-
+      {{ (mojang_manifest.content | from_json).versions
+         | selectattr('id', 'equalto', inst.version)
+         | map(attribute='url') | first }}
+
+- name: "[{{ inst.version }}] Descargar metadata de la versión"
+  ansible.builtin.uri:
+    url: "{{ _meta_url }}"
+    return_content: true
+  register: _meta
+
+- name: "[{{ inst.version }}] Descargar server.jar (verificando sha1)"
+  ansible.builtin.get_url:
+    url: "{{ (_meta.content | from_json).downloads.server.url }}"
+    checksum: "sha1:{{ (_meta.content | from_json).downloads.server.sha1 }}"
+    dest: "{{ base_dir }}/{{ inst.nombre }}/{{ inst.jar }}"
+    owner: root
+    group: root
+    mode: '0644'

