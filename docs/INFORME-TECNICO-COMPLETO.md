@@ -179,14 +179,15 @@ sudo sysctl -w net.ipv4.ip_forward=1
 
 En la VM `mc` corren **dos** servidores de Minecraft en paralelo, gestionados por **systemd**:
 
-| Instancia | Versión | Puerto juego | Puerto RCON | log4j | Rol |
+| Instancia | Versión | Puerto juego | Puerto RCON | JVM | Rol |
 |---|---|---|---|---|---|
-| **Actualizada** | 26.3 | `25565` | `25575` | parcheado | "servicio seguro" / jugador legítimo |
-| **Vulnerable** | 1.18 | `25566` | `25576` | **2.14.1** | blanco de Log4Shell |
+| **Actualizada** | 26.3 | `25565` | `25575` | OpenJDK **25** (`/usr/lib/jvm/java-25-openjdk-amd64`) | "servicio seguro" / jugador legítimo |
+| **Vulnerable** | 1.18 (log4j **2.14.1**) | `25566` | `25576` | **BellSoft Java 17** (`/usr/lib/jvm/bellsoft-java17-amd64`) | blanco de Log4Shell |
 
-- **Unidades systemd** (en `mc`):
-  - `mc-actualizado.service` — "Minecraft 26.3 - Proyecto Admin de Redes"
-  - `mc-vulnerable.service` — "Minecraft 1.18 - Proyecto Admin de Redes"
+- **Unidades systemd** (en `mc`), cada una con su **usuario de sistema dedicado** (`mc-actualizado` / `mc-vulnerable`):
+  - `mc-actualizado.service` — "Minecraft 26.3 - Proyecto Admin de Redes" — `WorkingDirectory=/srv-proyecto-admin/mc-actualizado`, `ExecStart=… -Xms1G -Xmx2G -jar server-26.3.jar nogui`.
+  - `mc-vulnerable.service` — "Minecraft 1.18 - Proyecto Admin de Redes" — `WorkingDirectory=/srv-proyecto-admin/mc-vulnerable`, `ExecStart=… -Xms1G -Xmx2G -jar server-1.18.jar nogui`.
+- **Base en disco:** `/srv-proyecto-admin/<instancia>/` (jars propiedad de `root`; `server.properties`, `world/`, `eula.txt`, etc. propiedad del usuario de la instancia).
 - **`online-mode=false`** en ambas (en `server.properties`): permite conectarse sin autenticación de Mojang (necesario para la demo con cuentas no premium y para el túnel).
 - **RCON habilitado** en ambas (`enable-rcon=true`, `rcon.port=2557x`, `rcon.password=admin123`): permite ejecutar comandos del servidor de forma remota — se usa para inyectar el payload de Log4Shell y para contar jugadores.
 - **`whitelist` desactivada** durante la demo (para que Juan entre sin estar en lista).
@@ -406,7 +407,7 @@ No se busca RCE real (es peligroso y además esta build de Java lo bloquea). Lo 
 El callback es ideal para el proyecto porque es un **evento de red** → se cuenta en el firewall (`c_callback`) y se grafica en Grafana. Es el "verificador" de la vulnerabilidad sin necesidad de RCE.
 
 ### 7.3 Por qué hay callback pero no RCE
-La JVM usada es **Java 17**, que por defecto tiene `com.sun.jndi.ldap.object.trustURLCodebase=false` → **no** descarga ni ejecuta clases remotas por LDAP. Resultado:
+La instancia vulnerable (1.18) corre sobre **BellSoft Java 17**, que por defecto tiene `com.sun.jndi.ldap.object.trustURLCodebase=false` → **no** descarga ni ejecuta clases remotas por LDAP. Resultado:
 - El **callback sí se dispara** (el servidor intenta conectar al LDAP) → observable.
 - El **RCE no ocurre** (Java 17 no ejecuta el código remoto) → seguro para demostrar.
 
@@ -446,38 +447,48 @@ para que el nombre consultado revelara la versión de Java. **No funcionó**: es
                                                                            ├─► node_exporter ──► Prometheus ──► Grafana
   servidor (RCON list)   ──► mc-players.py  ──► minecraft_players (textfile)┘
 ```
-- **Prometheus** usa modelo **pull**: hace *scrape* cada **5 s** a los `node_exporter` de gateway y servidor.
+- **Prometheus y Grafana corren en el GATEWAY** (`gw`), no en el servidor. OS: **Debian 13 (trixie)**.
+- **Prometheus** usa modelo **pull**: hace *scrape* cada **5 s**. El `prometheus.yml` apunta a `localhost:9100` (node_exporter del gateway) y `10.10.10.10:9100` (node_exporter del servidor).
 - Las métricas custom se publican vía el **textfile collector** de node_exporter (archivos `.prom` en `/var/lib/prometheus/node-exporter/`).
 
 ### 8.2 Exportador del firewall (en el gateway)
-`/usr/local/bin/nft-metrics.sh` — lee los counters en JSON y escribe el textfile:
+`/usr/local/bin/nft-metrics.sh` — lee los counters en JSON (con `python3`) y escribe el textfile. Contenido real:
 ```bash
-#!/bin/bash
-# Lee los counters nombrados de nftables y los expone en formato Prometheus
+#!/usr/bin/env bash
 OUT=/var/lib/prometheus/node-exporter/nftables.prom
-nft -j list counters | \
-  jq -r '.nftables[] | select(.counter) | .counter |
-         "nft_counter_packets{name=\"\(.name)\"} \(.packets)\n
-          nft_counter_bytes{name=\"\(.name)\"} \(.bytes)"' > "$OUT.tmp"
-mv "$OUT.tmp" "$OUT"
+mkdir -p "$(dirname "$OUT")"
+TMP="$OUT.$$"
+{
+  echo "# HELP nft_counter_packets Paquetes por contador nftables con nombre."
+  echo "# TYPE nft_counter_packets counter"
+  nft -j list counters 2>/dev/null | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+for o in d.get("nftables",[]):
+    c=o.get("counter")
+    if c and "name" in c:
+        print("nft_counter_packets{name=\"%s\"} %d"%(c["name"],c.get("packets",0)))
+'
+} > "$TMP" && mv "$TMP" "$OUT"
 ```
-Ejecutado periódicamente por un **timer systemd** `nft-metrics.timer` (cada **5 s**) → `nft-metrics.service`.
+Ejecutado periódicamente por un **timer systemd** `nft-metrics.timer` (`OnBootSec=10`, `OnUnitActiveSec=5` → cada **5 s**) → `nft-metrics.service` (oneshot).
 
-Métricas resultantes:
+Métricas resultantes (solo `packets`, no hay `_bytes`):
 - `nft_counter_packets{name="c_callback"}`
 - `nft_counter_packets{name="c_fwd_drop"}`
 - `nft_counter_packets{name="c_aceptado_25565"}`
-- (+ las variantes `_bytes`)
 
 ### 8.3 Exportador de jugadores (en el servidor)
-`/usr/local/bin/mc-players.py` — consulta por RCON el comando `list` en cada instancia y publica cuántos jugadores hay:
-```python
-# pseudo-resumen: por cada instancia (25575, 25576) hace RCON 'list',
-# parsea "There are N of a max..." y escribe:
-# minecraft_players_online{exported_instance="actualizado"} N
-# minecraft_players_online{exported_instance="vulnerable"} N
+`/usr/local/bin/mc-players.py` (en el **servidor**) — abre una conexión RCON a cada instancia (25575 y 25576, pass `admin123`), ejecuta `list`, extrae el número de jugadores y escribe el textfile `minecraft.prom`:
 ```
-Ejecutado por `mc-players.timer` cada **10 s** → `mc-players.service`. En Grafana la etiqueta se muestra como `{{exported_instance}}`.
+# HELP minecraft_players_online Jugadores conectados por instancia.
+# TYPE minecraft_players_online gauge
+minecraft_players_online{instance="actualizado"} N
+minecraft_players_online{instance="vulnerable"}  N
+```
+Ejecutado por `mc-players.timer` (`OnBootSec=30`, `OnUnitActiveSec=10` → cada **10 s**) → `mc-players.service` (oneshot).
+
+> **Detalle fino:** el script emite la etiqueta `instance="…"`, pero Prometheus ya usa `instance` para el *target* del scrape, así que al colisionar la **renombra a `exported_instance`**. Por eso en Grafana los paneles usan `{{exported_instance}}`.
 
 ### 8.4 Grafana — dashboard
 - **Login:** usuario `admin`, contraseña `1234`.
@@ -497,7 +508,7 @@ Ejecutado por `mc-players.timer` cada **10 s** → `mc-players.service`. En Graf
 > El panel "Call LoopBack / Callback Log4Shell" es el protagonista: sube en fase1 cuando el exploit sale, y en fase2 se ve además subir `c_fwd_drop` mientras el callback no llega a destino.
 
 ### 8.5 Enlace y acceso a Grafana
-Grafana escucha en la VM correspondiente (puerto 3000 por defecto). Se accede desde el host por la IP de la VM que lo aloje, p. ej. `http://192.168.56.10:3000` (gateway) — ajustar según dónde esté desplegado en tu copia.
+Grafana corre en el **gateway** (`grafana-server`, puerto 3000). Se accede desde el host en **`http://192.168.56.10:3000`** (login `admin` / `1234`). Prometheus también vive en el gateway (`prometheus`, puerto 9090).
 
 ---
 
@@ -738,17 +749,20 @@ Secuencia para levantar **todo el proyecto desde nada**, sin los OVA. Cada paso 
 - `mc`: IP `10.10.10.10/24`, gateway por defecto `10.10.10.1`; ruta `192.168.56.0/24 via 10.10.10.1`.
 
 **Paso 4 — Firewall en el gateway** (§6)
-- `sudo apt install -y nftables jq`.
+- `sudo apt install -y nftables python3`.
 - Crear `/root/gateway/` y colocar `fase1-vulnerable.nft`, `fase2-segura.nft`, `aplicar-fase.sh` (contenido verbatim en §6.3, §6.4, §6.6).
 - `sudo /root/gateway/aplicar-fase.sh fase1`.
+- (Mejora) Instalar `firewall-fase.service` para re-aplicar la fase en cada boot (ver §16 / repo `provision.yml`).
 
 **Paso 5 — Servicio Minecraft en el servidor** (§5)
-- Instalar Java 17 (`sudo apt install -y openjdk-17-jre-headless`).
+- Instalar las dos JVMs: **BellSoft Java 17** (repo de BellSoft) para la 1.18 y **OpenJDK 25** (`openjdk-25-jre-headless`; backports si hace falta) para la 26.3.
+- Crear usuarios de sistema `mc-actualizado` y `mc-vulnerable`; base en `/srv-proyecto-admin/<instancia>/`.
 - Dos instancias:
-  - **Vulnerable**: Minecraft 1.18 con **log4j 2.14.1**, puerto `25565→` (interno 25566 en este montaje), RCON `25576`.
-  - **Actualizada**: Minecraft 26.3, puerto `25565`, RCON `25575`.
-  - En cada `server.properties`: `online-mode=false`, `enable-rcon=true`, `rcon.port=2557x`, `rcon.password=admin123`, `white-list=false`.
-- Crear las unidades systemd `mc-vulnerable.service` y `mc-actualizado.service` (arranque de cada `java -jar ...`).
+  - **Vulnerable**: Minecraft 1.18 (log4j **2.14.1** embebido en `server-1.18.jar`), puerto `25566`, RCON `25576`, JVM BellSoft 17.
+  - **Actualizada**: Minecraft 26.3, puerto `25565`, RCON `25575`, JVM OpenJDK 25.
+  - En cada `server.properties`: `online-mode=false`, `enable-rcon=true`, `rcon.port=2557x`, `rcon.password=admin123`, `white-list=false`, `server-ip=10.10.10.10`.
+  - Los `server.jar` se bajan del **manifiesto oficial de Mojang** (ids `26.3` y `1.18`, verificando `sha1`).
+- Crear las unidades systemd `mc-vulnerable.service` y `mc-actualizado.service` con `User=`/`WorkingDirectory=` por instancia y `ExecStart=<jvm> -Xms1G -Xmx2G -jar server-<v>.jar nogui`.
 
 **Paso 6 — Monitoreo** (§8)
 - En `gw` y `mc`: instalar `prometheus-node-exporter` con el **textfile collector** apuntando a `/var/lib/prometheus/node-exporter/`.
@@ -806,7 +820,7 @@ Grafana y Prometheus se apagan solos con sus VMs; los datos persisten en disco.
 ## 15. Hallazgos y observaciones para el informe
 
 1. **Mitigación sin cortar al usuario legítimo.** Al pasar de fase1 a fase2 en caliente, el jugador ya conectado (puerto 25566) **no se desconecta** gracias a `ct state established,related accept`. En Grafana esto se ve como: **sin tráfico nuevo** en 25565/25566 para conexiones nuevas, pero **jugador presente** y, si se reintenta el exploit, **callback bloqueado**. Demuestra que seguridad y disponibilidad no son incompatibles si se usa seguimiento de conexiones.
-2. **El callback como verificador observable.** No hace falta RCE para demostrar la vulnerabilidad: el intento de conexión saliente a `:1389` es señal suficiente y se mide en el firewall. Java 17 bloquea la ejecución remota, pero el callback igual se dispara → entorno seguro para demostrar.
+2. **El callback como verificador observable.** No hace falta RCE para demostrar la vulnerabilidad: el intento de conexión saliente a `:1389` es señal suficiente y se mide en el firewall. BellSoft Java 17 (la JVM de la instancia vulnerable) bloquea la ejecución remota, pero el callback igual se dispara → entorno seguro para demostrar.
 3. **Efecto DDoS de los callbacks.** Al generar una carga masiva de callbacks en fase1, se observó que el jugador llegó a caerse del servidor — una ilustración concreta del impacto de un flujo descontrolado de eventos.
 4. **Reducción de superficie de ataque, medible con nmap.** Fase1 expone 25565-25580; fase2 solo 25565. El contraste por escaneo es evidencia directa del endurecimiento.
 5. **Exfiltración por DNS (teórica).** El payload con lookup anidado `${sys:java.version}` no produjo consulta DNS en esta build (no sustituye lookups anidados dentro de JNDI). Se documenta como vector teórico; la demo usa el callback plano.
@@ -818,7 +832,7 @@ Grafana y Prometheus se apagan solos con sus VMs; los datos persisten en disco.
 
 | Síntoma | Causa | Solución |
 |---|---|---|
-| Grafana "No data" en paneles de firewall tras reiniciar gw | nftables se vacía en cada boot | `sudo /root/gateway/aplicar-fase.sh fase1` |
+| Grafana "No data" en paneles de firewall tras reiniciar gw | nftables se vacía en cada boot | `sudo /root/gateway/aplicar-fase.sh fase1`. **Resuelto** con `firewall-fase.service` (lo reaplica al boot) — instalado en el gateway y en `provision.yml`. |
 | El juego no entra (ni 25565 ni 25566) | Falta DNAT (firewall sin cargar) | Aplicar una fase en el gateway |
 | Jugador externo "can't connect to server"; log playit: `failed to connect to local TCP server` | Túnel apunta a 25566 pero gw en fase2 (no lo expone), o servidor caído | Aplicar fase1, o mover túnel a 25565; verificar `nc -vz 192.168.56.10 <puerto>` y que la instancia esté `active` |
 | Ansible no alcanza `mc` | ProxyJump/SSH mal, o gw caído | `ansible -i inventory.ini all -m ping`; revisar ProxyJump por `jbjp_gw@192.168.56.10` |
