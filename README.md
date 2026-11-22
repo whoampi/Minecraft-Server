@@ -1,4 +1,4 @@
-# TEL342 — Servidor Minecraft seguro tras firewall (IaC)
+#Servidor Minecraft con firewall implementado
 
 Proyecto de **Administración de Redes de Computadores** (UTFSM). Un servicio de
 Minecraft expuesto de forma controlada tras un **gateway Debian con firewall
